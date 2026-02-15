@@ -432,9 +432,13 @@ class TestObserver:
         s2 = state.information_state_string(2)
         assert s0 != s1
         assert s1 != s2
-        assert "Y1" in s0
-        assert "R1" in s1
-        assert "G1" in s2
+        # With canonical suits: trump=Red→T, non-trump→A/B/C
+        # P0 has Y1 (non-trump) → canonical "A1"
+        assert "A1" in s0
+        # P1 has R1 (trump) → canonical "T1"
+        assert "T1" in s1
+        # P2 has G1 (non-trump) → canonical "A1"
+        assert "A1" in s2
 
     def test_info_state_tensor_shape(self):
         game = pyspiel.load_game("python_wizard", {"num_players": 3, "num_cards": 1})
@@ -505,6 +509,106 @@ class TestFullGameFlow:
         assert scores[0] == -10.0  # bid 1, won 0
         assert scores[1] == -10.0  # bid 0, won 1
         assert scores[2] == 20.0   # bid 0, won 0
+
+
+# ---------------------------------------------------------------------------
+# Suit isomorphism
+# ---------------------------------------------------------------------------
+
+class TestSuitIsomorphism:
+
+    def _deal_and_trump(self, p0_cards, p1_cards, p2_cards, trump_card):
+        """Build a state with specific hands and trump for 3 players."""
+        game = pyspiel.load_game("python_wizard", {"num_players": 3, "num_cards": len(p0_cards)})
+        state = game.new_initial_state()
+        all_cards = []
+        nc = len(p0_cards)
+        hands = [p0_cards, p1_cards, p2_cards]
+        for i in range(nc):
+            for p in range(3):
+                all_cards.append(hands[p][i])
+        for c in all_cards:
+            state.apply_action(c)
+        state.apply_action(trump_card)
+        return state
+
+    def test_swapped_non_trump_suits_same_string(self):
+        """Swapping non-trump suits should give identical info state strings."""
+        # Trump is Red (color 1). Player 0 has Yellow 7.
+        state_a = self._deal_and_trump([6], [14], [27], 15)  # Y7, R2, G2, trump=R3
+        # Trump is Red (color 1). Player 0 has Green 7 instead.
+        state_b = self._deal_and_trump([32], [14], [1], 15)  # G7, R2, Y2, trump=R3
+
+        s_a = state_a.information_state_string(0)
+        s_b = state_b.information_state_string(0)
+        assert s_a == s_b, f"Expected identical:\n  {s_a}\n  {s_b}"
+
+    def test_swapped_non_trump_suits_same_tensor(self):
+        """Swapping non-trump suits should give identical info state tensors."""
+        state_a = self._deal_and_trump([6], [14], [27], 15)  # Y7, R2, G2, trump=R3
+        state_b = self._deal_and_trump([32], [14], [1], 15)  # G7, R2, Y2, trump=R3
+
+        t_a = np.array(state_a.information_state_tensor(0))
+        t_b = np.array(state_b.information_state_tensor(0))
+        np.testing.assert_array_equal(t_a, t_b)
+
+    def test_trump_vs_non_trump_different(self):
+        """A trump card and a non-trump card of same value must differ."""
+        # Trump Red. P0 has R7 (trump card)
+        state_a = self._deal_and_trump([19], [0], [26], 14)  # R7, Y1, G1, trump=R2
+        # Trump Red. P0 has Y7 (non-trump card)
+        state_b = self._deal_and_trump([6], [0], [26], 14)   # Y7, Y1, G1, trump=R2
+
+        s_a = state_a.information_state_string(0)
+        s_b = state_b.information_state_string(0)
+        assert s_a != s_b, "Trump vs non-trump card should differ"
+
+    def test_canonical_map_preserves_wizards_jesters(self):
+        """Wizards and Jesters should be unchanged by remapping."""
+        from wizard_game import canonical_suit_map, remap_card
+        suit_map = canonical_suit_map(1, [52, 56, 19], [])  # W1, J1, R7
+        assert remap_card(52, suit_map) == 52  # Wizard unchanged
+        assert remap_card(56, suit_map) == 56  # Jester unchanged
+
+    def test_canonical_map_deterministic(self):
+        """Same inputs should always produce same mapping."""
+        from wizard_game import canonical_suit_map
+        hand = [6, 19, 52]  # Y7, R7, W1
+        m1 = canonical_suit_map(1, hand, [26])  # trump=Red
+        m2 = canonical_suit_map(1, hand, [26])
+        assert m1 == m2
+
+    def test_three_non_trump_suits_all_canonical(self):
+        """Three distinct non-trump suits get labels A, B, C."""
+        from wizard_game import canonical_suit_map
+        # Trump = Red (1). Hand has Yellow (0), Green (2), Blue (3)
+        hand = [0, 26, 39]  # Y1, G1, B1
+        m = canonical_suit_map(1, hand, [])
+        assert m[1] == 0  # Red (trump) -> 0
+        assert m[0] == 1  # Yellow -> A (first non-trump in sorted hand)
+        assert m[2] == 2  # Green -> B
+        assert m[3] == 3  # Blue -> C
+
+    def test_no_trump_isomorphism(self):
+        """With no trump, all 4 suits should still get canonical labels."""
+        # Use a Jester as trump card -> no trump
+        game = pyspiel.load_game("python_wizard", {"num_players": 3, "num_cards": 1})
+        state = game.new_initial_state()
+        state.apply_action(6)   # P0: Y7
+        state.apply_action(19)  # P1: R7
+        state.apply_action(32)  # P2: G7
+        state.apply_action(56)  # Trump: Jester -> no trump
+
+        s0 = state.information_state_string(0)
+        assert "t:N" in s0  # no-trump marker
+
+    def test_isomorphism_random_playthroughs(self):
+        """Random games still complete correctly with isomorphism enabled."""
+        rng = random.Random(999)
+        for seed in range(50):
+            state = _play_random_game(3, 3, seed=seed)
+            assert state.is_terminal()
+            assert sum(state._tricks_won) == 3
 
 
 if __name__ == "__main__":

@@ -231,5 +231,144 @@ class TestDebugMode:
         assert elapsed < 60, f"Debug mode took {elapsed:.1f}s (limit: 60s)"
 
 
+# ---------------------------------------------------------------------------
+# Deep CFR
+# ---------------------------------------------------------------------------
+
+class TestDeepCFRInit:
+
+    def test_solver_creates(self, game_1c):
+        from open_spiel.python.pytorch.deep_cfr import DeepCFRSolver
+        solver = DeepCFRSolver(game_1c, num_iterations=1, num_traversals=1)
+        assert solver is not None
+
+    def test_solver_creates_2card(self, game_2c):
+        from open_spiel.python.pytorch.deep_cfr import DeepCFRSolver
+        solver = DeepCFRSolver(game_2c, num_iterations=1, num_traversals=1)
+        assert solver is not None
+
+
+class TestDeepCFRSolve:
+
+    def test_solve_completes(self, game_1c):
+        from open_spiel.python.pytorch.deep_cfr import DeepCFRSolver
+        solver = DeepCFRSolver(
+            game_1c,
+            num_iterations=2,
+            num_traversals=5,
+            policy_network_train_steps=10,
+            advantage_network_train_steps=10,
+        )
+        policy_net, adv_losses, policy_loss = solver.solve()
+        assert policy_net is not None
+        assert float(policy_loss) >= 0  # may be numpy scalar
+
+    def test_action_probs_valid(self, game_1c):
+        """After solve, action_probabilities should return a dict over legal actions."""
+        import random
+        from open_spiel.python.pytorch.deep_cfr import DeepCFRSolver
+        solver = DeepCFRSolver(
+            game_1c,
+            num_iterations=3,
+            num_traversals=10,
+            policy_network_train_steps=100,
+            advantage_network_train_steps=50,
+        )
+        solver.solve()
+
+        rng = random.Random(42)
+        for _ in range(10):
+            state = game_1c.new_initial_state()
+            while not state.is_terminal():
+                if state.is_chance_node():
+                    outcomes = state.chance_outcomes()
+                    actions, probs = zip(*outcomes)
+                    state.apply_action(rng.choices(actions, weights=probs, k=1)[0])
+                else:
+                    ap = solver.action_probabilities(state)
+                    assert len(ap) > 0, "No actions returned"
+                    probs = np.array(list(ap.values()), dtype=np.float64)
+                    probs = np.maximum(probs, 0)
+                    s = probs.sum()
+                    if s > 0:
+                        probs /= s
+                    else:
+                        probs = np.ones(len(probs)) / len(probs)
+                    action = rng.choices(list(ap.keys()),
+                                         weights=probs.tolist(), k=1)[0]
+                    state.apply_action(action)
+
+
+class TestDeepCFRCheckpoint:
+
+    def test_checkpoint_round_trip(self, game_1c, tmp_dir):
+        import torch
+        from open_spiel.python.pytorch.deep_cfr import DeepCFRSolver
+        from train import save_deep_cfr_checkpoint, load_deep_cfr_checkpoint
+
+        solver = DeepCFRSolver(
+            game_1c,
+            num_iterations=2,
+            num_traversals=3,
+            policy_network_train_steps=10,
+            advantage_network_train_steps=10,
+        )
+        solver.solve()
+
+        # Save
+        save_deep_cfr_checkpoint(solver, round_num=1, num_players=3,
+                                 output_dir=tmp_dir)
+
+        # Load
+        data = load_deep_cfr_checkpoint(tmp_dir, round_num=1)
+        assert data is not None
+        assert data["solver_type"] == "deep_cfr"
+        assert data["round"] == 1
+        assert data["num_players"] == 3
+
+        # Reconstruct and compare weights
+        solver2 = DeepCFRSolver(game_1c, num_iterations=1, num_traversals=1)
+        solver2._policy_network.load_state_dict(data["policy_network"])
+
+        # Check that weights are the same
+        for p1, p2 in zip(solver._policy_network.parameters(),
+                          solver2._policy_network.parameters()):
+            torch.testing.assert_close(p1, p2)
+
+
+class TestDeepCFRTrainRound:
+
+    def test_train_round_deep_cfr_produces_summary(self, tmp_dir):
+        from train import train_round_deep_cfr
+        cfg = {
+            "iterations": 2,
+            "traversals": 5,
+            "lr": 1e-3,
+            "batch_size": 32,
+            "memory_capacity": 1000,
+            "policy_layers": (64, 64),
+            "advantage_layers": (64, 64),
+            "policy_train_steps": 20,
+            "advantage_train_steps": 10,
+        }
+        summary = train_round_deep_cfr(
+            num_players=3, num_cards=1, cfg=cfg, output_dir=tmp_dir,
+        )
+        assert summary["solver"] == "deep_cfr"
+        assert summary["round"] == 1
+        assert "policy_loss" in summary
+        assert "final_mean_returns" in summary
+        assert len(summary["final_mean_returns"]) == 3
+        # Check checkpoint file exists
+        assert os.path.exists(os.path.join(tmp_dir, "round_1_deep_cfr.pt"))
+
+    def test_debug_deep_cfr_completes(self, tmp_dir):
+        """Deep CFR debug mode should complete quickly."""
+        t0 = time.time()
+        train_main(["--debug", "--solver", "deep_cfr", "--output-dir", tmp_dir])
+        elapsed = time.time() - t0
+        assert elapsed < 120, f"Deep CFR debug took {elapsed:.1f}s (limit: 120s)"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

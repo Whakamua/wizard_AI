@@ -1,10 +1,11 @@
-"""Training entrypoint for Wizard AI using External Sampling MCCFR.
+"""Training entrypoint for Wizard AI (MCCFR or Deep CFR).
 
 Usage:
-    python train.py                                    # full training
-    python train.py --debug                            # fast debug run
-    python train.py --num-players 4 --rounds 1,2,3     # custom config
-    python train.py --iterations 50000 --rounds 1,2    # custom iterations
+    python train.py                                            # MCCFR (default)
+    python train.py --debug                                    # fast debug
+    python train.py --solver deep_cfr --rounds 1,2,3           # Deep CFR
+    python train.py --solver deep_cfr --debug                  # Deep CFR debug
+    python train.py --num-players 4 --rounds 1,2,3             # custom config
 """
 
 import argparse
@@ -194,29 +195,195 @@ def train_round(num_players: int, num_cards: int, iterations: int,
 
 
 # ---------------------------------------------------------------------------
+# Deep CFR
+# ---------------------------------------------------------------------------
+
+def _import_deep_cfr():
+    """Lazy import of PyTorch Deep CFR to avoid hard dependency."""
+    import torch
+    from open_spiel.python.pytorch.deep_cfr import DeepCFRSolver
+    return torch, DeepCFRSolver
+
+
+def deep_cfr_checkpoint_path(output_dir: str, round_num: int) -> str:
+    return os.path.join(output_dir, f"round_{round_num}_deep_cfr.pt")
+
+
+def save_deep_cfr_checkpoint(solver, round_num: int, num_players: int,
+                             output_dir: str):
+    """Save Deep CFR networks to a torch checkpoint."""
+    torch, _ = _import_deep_cfr()
+    os.makedirs(output_dir, exist_ok=True)
+    data = {
+        "policy_network": solver._policy_network.state_dict(),
+        "advantage_networks": [
+            net.state_dict() for net in solver._advantage_networks
+        ],
+        "iteration": solver._iteration,
+        "round": round_num,
+        "num_players": num_players,
+        "solver_type": "deep_cfr",
+    }
+    path = deep_cfr_checkpoint_path(output_dir, round_num)
+    torch.save(data, path)
+    logger.info("Saved Deep CFR checkpoint: %s", path)
+
+
+def load_deep_cfr_checkpoint(output_dir: str, round_num: int):
+    """Load Deep CFR checkpoint, or return None."""
+    torch, _ = _import_deep_cfr()
+    path = deep_cfr_checkpoint_path(output_dir, round_num)
+    if not os.path.exists(path):
+        return None
+    data = torch.load(path, map_location="cpu", weights_only=False)
+    logger.info("Loaded Deep CFR checkpoint: %s", path)
+    return data
+
+
+def train_round_deep_cfr(num_players: int, num_cards: int, cfg: dict,
+                         output_dir: str):
+    """Train Deep CFR for a single round. Returns summary dict."""
+    torch, DeepCFRSolver = _import_deep_cfr()
+
+    logger.info("=== Training round %d with Deep CFR (%d players) ===",
+                num_cards, num_players)
+
+    game = pyspiel.load_game("python_wizard", {
+        "num_players": num_players,
+        "num_cards": num_cards,
+    })
+
+    solver = DeepCFRSolver(
+        game,
+        policy_network_layers=cfg["policy_layers"],
+        advantage_network_layers=cfg["advantage_layers"],
+        num_iterations=cfg["iterations"],
+        num_traversals=cfg["traversals"],
+        learning_rate=cfg["lr"],
+        batch_size_advantage=cfg["batch_size"],
+        batch_size_strategy=cfg["batch_size"],
+        memory_capacity=cfg["memory_capacity"],
+        policy_network_train_steps=cfg["policy_train_steps"],
+        advantage_network_train_steps=cfg["advantage_train_steps"],
+        reinitialize_advantage_networks=True,
+    )
+
+    t_start = time.time()
+    logger.info("Deep CFR: %d iterations x %d traversals, lr=%.1e, "
+                "batch=%d, memory=%d",
+                cfg["iterations"], cfg["traversals"], cfg["lr"],
+                cfg["batch_size"], cfg["memory_capacity"])
+
+    policy_net, advantage_losses, policy_loss = solver.solve()
+
+    elapsed = time.time() - t_start
+    pl_val = float(policy_loss) if policy_loss is not None else 0.0
+    logger.info("Round %d Deep CFR complete | %.1fs | policy_loss=%.6f",
+                num_cards, elapsed, pl_val)
+
+    # Log per-player advantage losses (final iteration)
+    for p, losses in advantage_losses.items():
+        valid = [l for l in losses if l is not None]
+        if valid:
+            logger.info("  Player %d advantage losses (last 3): %s", p,
+                        [round(float(l), 6) for l in valid[-3:]])
+
+    # Save checkpoint
+    save_deep_cfr_checkpoint(solver, num_cards, num_players, output_dir)
+
+    # Evaluate
+    mean_returns = evaluate_random_vs_policy(game, solver, num_episodes=200)
+    logger.info("Round %d Deep CFR eval | returns: %s",
+                num_cards, [round(r, 2) for r in mean_returns])
+
+    summary = {
+        "round": num_cards,
+        "num_players": num_players,
+        "solver": "deep_cfr",
+        "iterations": cfg["iterations"],
+        "traversals": cfg["traversals"],
+        "total_time_s": round(elapsed, 2),
+        "policy_loss": float(policy_loss) if policy_loss is not None else None,
+        "advantage_losses_final": {
+            str(p): float(losses[-1]) if losses and losses[-1] is not None else None
+            for p, losses in advantage_losses.items()
+        },
+        "final_mean_returns": mean_returns.tolist(),
+    }
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Train Wizard AI with MCCFR")
+    parser = argparse.ArgumentParser(description="Train Wizard AI")
     parser.add_argument("--debug", action="store_true",
-                        help="Fast debug run (100 iters, rounds 1-3)")
+                        help="Fast debug run")
+    parser.add_argument("--solver", type=str, default="mccfr",
+                        choices=["mccfr", "deep_cfr"],
+                        help="Algorithm: mccfr (tabular) or deep_cfr")
     parser.add_argument("--num-players", type=int, default=3,
                         help="Number of players (3-6, default: 3)")
     parser.add_argument("--rounds", type=str, default=None,
                         help="Comma-separated round numbers (default: all)")
     parser.add_argument("--iterations", type=int, default=None,
-                        help="MCCFR iterations per round")
+                        help="Iterations per round")
     parser.add_argument("--checkpoint-every", type=int, default=None,
-                        help="Save checkpoint every N iterations")
+                        help="Save checkpoint every N iterations (MCCFR)")
     parser.add_argument("--eval-every", type=int, default=None,
-                        help="Evaluate policy every N iterations")
+                        help="Evaluate every N iterations (MCCFR)")
     parser.add_argument("--output-dir", type=str, default="checkpoints",
                         help="Directory for checkpoints and results")
     parser.add_argument("--log-level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING"],
                         help="Logging level")
+    # Deep CFR specific
+    parser.add_argument("--traversals", type=int, default=None,
+                        help="Deep CFR: traversals per iteration")
+    parser.add_argument("--lr", type=float, default=1e-3,
+                        help="Deep CFR: learning rate")
+    parser.add_argument("--batch-size", type=int, default=2048,
+                        help="Deep CFR: batch size")
+    parser.add_argument("--memory-capacity", type=int, default=2_000_000,
+                        help="Deep CFR: reservoir buffer capacity")
+    parser.add_argument("--policy-layers", type=str, default="256,256",
+                        help="Deep CFR: policy network layers")
+    parser.add_argument("--advantage-layers", type=str, default="128,128",
+                        help="Deep CFR: advantage network layers")
+    parser.add_argument("--policy-train-steps", type=int, default=5000,
+                        help="Deep CFR: policy net training steps")
+    parser.add_argument("--advantage-train-steps", type=int, default=750,
+                        help="Deep CFR: advantage net training steps")
     return parser.parse_args(argv)
+
+
+def _build_deep_cfr_config(args, debug: bool) -> dict:
+    """Build Deep CFR hyperparameter dict from CLI args."""
+    if debug:
+        return {
+            "iterations": args.iterations or 5,
+            "traversals": args.traversals or 10,
+            "lr": args.lr,
+            "batch_size": args.batch_size,
+            "memory_capacity": args.memory_capacity,
+            "policy_layers": tuple(int(x) for x in args.policy_layers.split(",")),
+            "advantage_layers": tuple(int(x) for x in args.advantage_layers.split(",")),
+            "policy_train_steps": 100,
+            "advantage_train_steps": 50,
+        }
+    return {
+        "iterations": args.iterations or 100,
+        "traversals": args.traversals or 200,
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "memory_capacity": args.memory_capacity,
+        "policy_layers": tuple(int(x) for x in args.policy_layers.split(",")),
+        "advantage_layers": tuple(int(x) for x in args.advantage_layers.split(",")),
+        "policy_train_steps": args.policy_train_steps,
+        "advantage_train_steps": args.advantage_train_steps,
+    }
 
 
 def main(argv=None):
@@ -227,29 +394,23 @@ def main(argv=None):
 
     num_players = args.num_players
     max_round = 60 // num_players
+    solver_name = args.solver
 
     # Determine rounds to train
     if args.debug:
         rounds = list(range(1, min(4, max_round + 1)))
-        iterations = args.iterations or 100
-        checkpoint_every = args.checkpoint_every or 50
-        eval_every = args.eval_every or 50
-        logger.info("DEBUG MODE: rounds=%s, iterations=%d", rounds, iterations)
     else:
         if args.rounds:
             rounds = [int(r) for r in args.rounds.split(",")]
         else:
             rounds = list(range(1, max_round + 1))
-        iterations = args.iterations or 100_000
-        checkpoint_every = args.checkpoint_every or 10_000
-        eval_every = args.eval_every or 10_000
 
     output_dir = args.output_dir
     results_dir = os.path.join(output_dir, "results")
     os.makedirs(results_dir, exist_ok=True)
 
-    logger.info("Training config: %d players, rounds %s, %d iterations/round",
-                num_players, rounds, iterations)
+    logger.info("Training config: solver=%s, %d players, rounds %s",
+                solver_name, num_players, rounds)
 
     all_summaries = {}
     for round_num in rounds:
@@ -257,14 +418,34 @@ def main(argv=None):
             logger.warning("Skipping round %d (max %d for %d players)",
                            round_num, max_round, num_players)
             continue
-        summary = train_round(
-            num_players=num_players,
-            num_cards=round_num,
-            iterations=iterations,
-            checkpoint_every=checkpoint_every,
-            eval_every=eval_every,
-            output_dir=output_dir,
-        )
+
+        if solver_name == "deep_cfr":
+            cfg = _build_deep_cfr_config(args, args.debug)
+            summary = train_round_deep_cfr(
+                num_players=num_players,
+                num_cards=round_num,
+                cfg=cfg,
+                output_dir=output_dir,
+            )
+        else:
+            # MCCFR defaults
+            if args.debug:
+                iterations = args.iterations or 100
+                checkpoint_every = args.checkpoint_every or 50
+                eval_every = args.eval_every or 50
+            else:
+                iterations = args.iterations or 100_000
+                checkpoint_every = args.checkpoint_every or 10_000
+                eval_every = args.eval_every or 10_000
+            summary = train_round(
+                num_players=num_players,
+                num_cards=round_num,
+                iterations=iterations,
+                checkpoint_every=checkpoint_every,
+                eval_every=eval_every,
+                output_dir=output_dir,
+            )
+
         all_summaries[round_num] = summary
 
         # Write per-round summary

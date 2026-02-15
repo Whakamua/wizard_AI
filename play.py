@@ -100,16 +100,53 @@ def format_probs(action_probs: dict, top_n: int = 10) -> str:
 # Load policy
 # ---------------------------------------------------------------------------
 
+def _load_deep_cfr_policy(checkpoint_path: str, num_players: int, num_cards: int):
+    """Load a Deep CFR checkpoint and return a solver that provides
+    action_probabilities(state)."""
+    import torch
+    from open_spiel.python.pytorch.deep_cfr import DeepCFRSolver
+
+    data = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if data.get("num_players") != num_players:
+        print(f"ERROR: Checkpoint has {data['num_players']} players, "
+              f"but you specified {num_players}")
+        return None
+
+    game = pyspiel.load_game("python_wizard", {
+        "num_players": num_players,
+        "num_cards": num_cards,
+    })
+    # Create a solver with minimal settings just to reconstruct networks
+    solver = DeepCFRSolver(game, num_iterations=1, num_traversals=1)
+    solver._policy_network.load_state_dict(data["policy_network"])
+    for i, net_state in enumerate(data["advantage_networks"]):
+        solver._advantage_networks[i].load_state_dict(net_state)
+    print(f"Loaded Deep CFR policy: round {num_cards}, "
+          f"iteration {data.get('iteration', '?')}")
+    return solver
+
+
 def load_policy(checkpoint_dir: str, num_players: int, num_cards: int):
-    """Load the trained average policy for a specific round."""
-    path = os.path.join(checkpoint_dir, f"round_{num_cards}_latest.pkl")
-    if not os.path.exists(path):
-        print(f"ERROR: No checkpoint found at {path}")
+    """Load the trained policy for a specific round (MCCFR or Deep CFR).
+
+    Returns an object with action_probabilities(state) method.
+    """
+    # Try Deep CFR checkpoint first
+    deep_path = os.path.join(checkpoint_dir, f"round_{num_cards}_deep_cfr.pt")
+    mccfr_path = os.path.join(checkpoint_dir, f"round_{num_cards}_latest.pkl")
+
+    if os.path.exists(deep_path):
+        return _load_deep_cfr_policy(deep_path, num_players, num_cards)
+
+    if not os.path.exists(mccfr_path):
+        print(f"ERROR: No checkpoint found for round {num_cards}")
+        print(f"  Looked for: {deep_path}")
+        print(f"              {mccfr_path}")
         print(f"Train first: python train.py --num-players {num_players} "
               f"--rounds {num_cards}")
         return None
 
-    with open(path, "rb") as f:
+    with open(mccfr_path, "rb") as f:
         data = pickle.load(f)
 
     if data["num_players"] != num_players:
@@ -122,7 +159,7 @@ def load_policy(checkpoint_dir: str, num_players: int, num_cards: int):
         "num_cards": num_cards,
     })
     policy = AveragePolicy(game, list(range(num_players)), data["infostates"])
-    print(f"Loaded policy: round {num_cards}, {data['iteration']} iterations, "
+    print(f"Loaded MCCFR policy: round {num_cards}, {data['iteration']} iterations, "
           f"{len(data['infostates'])} information sets")
     return policy
 

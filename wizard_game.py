@@ -84,6 +84,72 @@ def card_name(card: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Suit isomorphism helpers
+# ---------------------------------------------------------------------------
+
+# Canonical color labels: index 0 = trump (T), 1-3 = non-trump (A, B, C)
+_CANONICAL_NAMES = ["T", "A", "B", "C"]
+
+
+def canonical_suit_map(trump_color: int, hand_cards, play_history_cards=()) -> dict:
+    """Map original color indices to canonical indices.
+
+    Trump always maps to 0.  Non-trump suits map to 1, 2, 3 based on the
+    order they first appear in the player's sorted hand, then the play
+    history.  Unseen suits are filled in ascending original-index order.
+    """
+    mapping = {}
+    if trump_color >= 0:
+        mapping[trump_color] = 0
+    next_id = 1 if trump_color >= 0 else 0
+    for card in list(sorted(hand_cards)) + list(play_history_cards):
+        c = card_color(card)
+        if c >= 0 and c not in mapping:
+            mapping[c] = next_id
+            next_id += 1
+    # Fill remaining unseen suits deterministically
+    for c in range(NUM_COLORS):
+        if c not in mapping:
+            mapping[c] = next_id
+            next_id += 1
+    return mapping
+
+
+def remap_card(card: int, suit_map: dict) -> int:
+    """Return the card id with its suit replaced according to *suit_map*.
+
+    Wizards and Jesters are unchanged.
+    """
+    if is_wizard(card) or is_jester(card):
+        return card
+    return suit_map[card_color(card)] * NUM_VALUES + (card_value(card) - 1)
+
+
+def canonical_card_name(card: int, suit_map: dict) -> str:
+    """Human-readable name using canonical suit labels."""
+    if is_wizard(card):
+        return f"W{card - WIZARD_START + 1}"
+    if is_jester(card):
+        return f"J{card - JESTER_START + 1}"
+    canon_idx = suit_map[card_color(card)]
+    return f"{_CANONICAL_NAMES[canon_idx]}{card_value(card)}"
+
+
+def _get_play_history(state) -> list:
+    """Extract the list of card-play actions from the full history."""
+    hist = state.history()
+    deal_actions = state._total_to_deal
+    trump_actions = 0 if state._is_last_round else 1
+    choose_actions = (
+        1 if (state._trump_card >= 0 and is_wizard(state._trump_card))
+        else 0
+    )
+    bid_actions = len(state._bids)
+    play_start = deal_actions + trump_actions + choose_actions + bid_actions
+    return hist[play_start:]
+
+
+# ---------------------------------------------------------------------------
 # OpenSpiel game registration
 # ---------------------------------------------------------------------------
 
@@ -471,20 +537,26 @@ class WizardObserver:
         nc = self._num_cards
         np_ = self._num_players
 
+        # Build canonical suit mapping
+        play_hist = _get_play_history(state)
+        suit_map = canonical_suit_map(
+            state._trump_color, state._hands[player], play_hist,
+        )
+
         # Player one-hot
         self.dict["player"][player] = 1
 
-        # Hand bitmap (private info)
+        # Hand bitmap (private info) — remapped suits
         if "hand" in self.dict:
             for card in state._hands[player]:
-                self.dict["hand"][card] = 1
+                self.dict["hand"][remap_card(card, suit_map)] = 1
 
-        # Trump color one-hot (public)
+        # Trump color one-hot (public) — canonical: trump is always slot 0
         if "trump_color" in self.dict:
             if state._trump_color == NO_TRUMP:
                 self.dict["trump_color"][4] = 1
-            elif state._trump_color >= 0:
-                self.dict["trump_color"][state._trump_color] = 1
+            else:
+                self.dict["trump_color"][0] = 1  # trump → canonical 0
 
         # Bids (public)
         if "bids" in self.dict:
@@ -499,63 +571,49 @@ class WizardObserver:
             for p in range(np_):
                 self.dict["tricks_won"][p] = state._tricks_won[p] / max(nc, 1)
 
-        # Play history (perfect recall)
+        # Play history (perfect recall) — remapped suits
         if "play_history" in self.dict:
-            slot = 0
-            # Reconstruct card plays from game history
-            hist = state.history()
-            deal_actions = state._total_to_deal
-            trump_actions = 0 if state._is_last_round else 1
-            choose_actions = (
-                1 if (state._trump_card >= 0 and is_wizard(state._trump_card))
-                else 0
-            )
-            bid_actions = len(state._bids)
-            play_start = deal_actions + trump_actions + choose_actions + bid_actions
-            play_hist = hist[play_start:]
-            for card in play_hist:
+            for slot, card in enumerate(play_hist):
                 if slot < self.dict["play_history"].shape[0]:
-                    self.dict["play_history"][slot, card] = 1
-                slot += 1
+                    self.dict["play_history"][slot, remap_card(card, suit_map)] = 1
 
     def string_from(self, state, player):
-        """Information state string for CFR: must be unique per info set."""
+        """Information state string for CFR: must be unique per info set.
+
+        Uses canonical suit labels so that strategically equivalent states
+        (differing only by non-trump suit identity) map to the same string.
+        """
+        play_hist = _get_play_history(state)
+        suit_map = canonical_suit_map(
+            state._trump_color, state._hands[player], play_hist,
+        )
+        _cn = lambda c: canonical_card_name(c, suit_map)  # noqa: E731
+
         parts = []
         parts.append(f"p{player}")
-        # Private: own hand
-        hand = sorted(state._hands[player])
-        parts.append("h:" + ",".join(card_name(c) for c in hand))
-        # Public: trump
+        # Private: own hand (sorted by remapped card id for consistency)
+        hand = sorted(state._hands[player], key=lambda c: remap_card(c, suit_map))
+        parts.append("h:" + ",".join(_cn(c) for c in hand))
+        # Public: trump — canonical label is always "T" (or "N" for none)
         if state._trump_color >= 0:
-            parts.append(f"t:{COLOR_NAMES[state._trump_color][0]}")
+            parts.append("t:T")
         elif state._phase.value >= Phase.BID.value:
             parts.append("t:N")
         # Public: all bids
         if state._bids:
             bids_str = ",".join(f"{p}:{b}" for p, b in state._bids)
             parts.append(f"b:[{bids_str}]")
-        # Public: full play history from game history
-        # Reconstruct card plays from the game action history
+        # Public: play history
         if state._phase == Phase.PLAY or state._game_over:
-            # Encode tricks won so far and current trick
             parts.append(f"tw:{state._tricks_won}")
             parts.append(f"tp:{state._tricks_played}")
             if state._current_trick:
                 ct = ",".join(
-                    f"{p}:{card_name(c)}" for p, c in state._current_trick
+                    f"{p}:{_cn(c)}" for p, c in state._current_trick
                 )
                 parts.append(f"ct:[{ct}]")
-            # For perfect recall, include the full action history
-            hist = state.history()
-            # Card play actions start after deal + trump + bids
-            deal_actions = state._total_to_deal
-            trump_actions = 0 if state._is_last_round else 1
-            choose_actions = 1 if (state._trump_card >= 0 and is_wizard(state._trump_card)) else 0
-            bid_actions = len(state._bids)
-            play_start = deal_actions + trump_actions + choose_actions + bid_actions
-            play_hist = hist[play_start:]
             if play_hist:
-                parts.append("ph:" + ",".join(card_name(a) for a in play_hist))
+                parts.append("ph:" + ",".join(_cn(a) for a in play_hist))
         return " ".join(parts)
 
 
